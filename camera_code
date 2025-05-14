@@ -1,0 +1,4 @@
+cd picamera2/examples/imx500/
+
+
+python imx500_object_detection_demo.py --model  /home/roshdi-24/picamera2/network.rpk --labels /home/roshdi-24/picamera2/labels.txt --fps 25 --bbox-normalization --ignore-dash-labels --bbox-order xy
