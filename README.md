@@ -1,6 +1,6 @@
 # 🤖 Autonomous Robot for WRO 2025 - Future Engineers
 
-Welcome to the official repository for our **Autonomous Robot** project, built as part of our entry for the **WRO 2025 Future Engineers Competition**. This project showcases a self-driving robot capable of detecting colored zones, avoiding collisions, and intelligently navigating its environment — all under the constraints of time, resources, and technical challenges.
+Welcome to the official repository for our **Autonomous Robot** project, built as part of our entry for the **WRO 2025 Future Engineers Competition**. This project showcases a self-driving robot capable of detecting colored zones, avoiding collisions, and intelligently navigating its environment — all under the constraints of time, resources, and technical challenges. (Made within a timeframe of 2 weeks)
 
 ## 🏁 Project Overview
 
