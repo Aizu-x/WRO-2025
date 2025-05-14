@@ -2,6 +2,6 @@
 The KCST Repository For WRO-2025 Future Engineers
 
 It will include the following:
-  WRO-Robot Code
-  & WRO-AICAMERA Data+Label
+  WRO-Raspberry-pi-model-B Python Code 
+  &  WRO-Raspberry-pi-model-B AICAMERA Data+Label
   
