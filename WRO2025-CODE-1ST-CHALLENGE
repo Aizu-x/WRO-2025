@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+import time, csv, collections
+import RPi.GPIO as GPIO
+import pigpio
+
+# ===============================
+# ========= PINS (BCM) ==========
+# ===============================
+ENAB, IN3, IN4 = 17, 22, 27          # L298N (single motor side)
+SERVO = 4                             # Steering servo (signal)
+FR_TRIG, FR_ECHO = 10, 9              # Front ultrasonic
+LF_TRIG, LF_ECHO = 5, 6               # Left ultrasonic
+RT_TRIG, RT_ECHO = 24, 23             # Right ultrasonic
+BTN = 2                               # Start/Pause button (to GND)
+
+# ===============================
+# ======= MAIN TUNING KNOBS =====
+# ===============================
+
+# ---- Speeds (% PWM) ----
+CRUISE_SPEED      = 100     # normal forward
+TURN_SPEED        = 85      # while turning
+MIN_SPEED         = 45      # not used unless you want slow zones
+
+# ---- Steering (absolute angles) ----
+STEER_CENTER      = 131    # your calibrated straight
+TURN_DEG          = 45     # fixed turn offset from center (both directions)
+STEER_RANGE       = 50     # safety clamp around center
+STEER_MIN         = max(0,   STEER_CENTER - STEER_RANGE)
+STEER_MAX         = min(180, STEER_CENTER + STEER_RANGE)
+
+# ---- Turn timing (distance-independent) ----
+TURN_TIME_S       = 1.0   # how long to hold the turn, no matter the distance
+EXIT_STRAIGHT_S   = 1     # how long to drive straight after a turn before next decision
+
+# ---- Obstacle detection ----
+FRONT_START_CM    = 90    # start a turn decision if front <= this
+CLEAR_CM          = 130   # consider path “clear/straight” when front >= this
+
+# ---- Self-learning direction lock ----
+LOCK_CONFIRM_STRAIGHT_S = 0.5   # straight time after a completed turn to lock that direction
+
+# ---- Ultrasonic sampling ----
+SAMPLE_HZ         = 15
+ECHO_TIMEOUT      = 0.02
+MEDIAN_N          = 3
+INTER_PING_DELAY  = 0.003
+LOOP_SLEEP        = 0.003
+
+# ---- Servo output (pigpio) ----
+SERVO_MIN_US, SERVO_MAX_US = 1000, 2000
+SMOOTH_STEP_DEG   = 6
+SMOOTH_HZ         = 180
+
+# ---- Debug / CSV ----
+DEBUG             = True
+LOG_TO_CSV        = False
+CSV_PATH          = "wro_log.csv"
+TELEMETRY_HZ      = 5
+
+# ===============================
+# ========== UTILITIES ==========
+# ===============================
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def angle_to_us(a):
+    a = clamp(a, 0, 180)
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
+
+class MedianFilter:
+    def __init__(self, n): self.buf = collections.deque(maxlen=n)
+    def push(self, x):
+        if x is not None: self.buf.append(x)
+        if not self.buf: return None
+        s = sorted(self.buf)
+        return s[len(s)//2]
+
+# ===============================
+# ======== HARDWARE I/O =========
+# ===============================
+def setup_ultra(trig, echo):
+    GPIO.setup(trig, GPIO.OUT); GPIO.output(trig, 0)
+    GPIO.setup(echo, GPIO.IN)
+
+def measure_cm(trig, echo):
+    """HC-SR04 style measure; returns cm or None on timeout."""
+    GPIO.output(trig, 0); time.sleep(0.000002)
+    GPIO.output(trig, 1); time.sleep(0.00001); GPIO.output(trig, 0)
+    t0 = time.perf_counter()
+    while GPIO.input(echo) == 0:
+        if time.perf_counter() - t0 > ECHO_TIMEOUT: return None
+    start = time.perf_counter()
+    while GPIO.input(echo) == 1:
+        if time.perf_counter() - start > ECHO_TIMEOUT: return None
+    end = time.perf_counter()
+    return (end - start) * 34300.0 / 2.0
+
+def motor_setup():
+    GPIO.setup(ENAB, GPIO.OUT); GPIO.setup(IN3, GPIO.OUT); GPIO.setup(IN4, GPIO.OUT)
+    pwm = GPIO.PWM(ENAB, 1000); pwm.start(0)
+    def set_speed(p): pwm.ChangeDutyCycle(clamp(p, 0, 100))
+    def fwd():  GPIO.output(IN3,1); GPIO.output(IN4,0)
+    def back(): GPIO.output(IN3,0); GPIO.output(IN4,1)
+    def stop(): GPIO.output(IN3,0); GPIO.output(IN4,0)
+    return pwm, set_speed, fwd, back, stop
+
+class SmoothServo:
+    def __init__(self, pi, pin):
+        self.pi, self.pin = pi, pin
+        self.angle = STEER_CENTER
+        self.target = STEER_CENTER
+        self.dt = 1.0 / SMOOTH_HZ
+        self.last = 0.0
+        self.pi.set_servo_pulsewidth(pin, angle_to_us(self.angle))
+    def set_target(self, ang):
+        self.target = clamp(ang, STEER_MIN, STEER_MAX)
+    def center(self):
+        self.set_target(STEER_CENTER)
+    def tick(self, now):
+        if now - self.last < self.dt: return
+        self.last = now
+        if self.target == self.angle: return
+        step = SMOOTH_STEP_DEG if self.target > self.angle else -SMOOTH_STEP_DEG
+        nxt = self.angle + step
+        if (step > 0 and nxt > self.target) or (step < 0 and nxt < self.target):
+            nxt = self.target
+        self.angle = clamp(nxt, STEER_MIN, STEER_MAX)
+        self.pi.set_servo_pulsewidth(self.pin, angle_to_us(self.angle))
+
+# ===============================
+# ======= TURN CONTROLLER =======
+# ===============================
+class TurnEpisode:
+    """
+    Handles the fixed-angle, fixed-time steering you asked for:
+    - When active: sets servo to CENTER ± TURN_DEG and holds TURN_SPEED.
+    - After TURN_TIME_S: returns to straight and enforces a brief EXIT_STRAIGHT_S
+      before considering new turns.
+    """
+    def __init__(self, servo, set_speed, fwd):
+        self.servo = servo
+        self.set_speed = set_speed
+        self.fwd = fwd
+        self.active = False
+        self.end_t = 0.0
+        self.after_straight_until = 0.0
+        self.dir = None  # 'L' or 'R'
+    def start(self, side_dir):
+        self.dir = side_dir
+        ang = STEER_CENTER + ( +TURN_DEG if side_dir == 'L' else -TURN_DEG )
+        self.servo.set_target(ang)
+        self.set_speed(TURN_SPEED); self.fwd()
+        self.active = True
+        self.end_t = time.monotonic() + TURN_TIME_S
+    def update(self):
+        now = time.monotonic()
+        if self.active and now >= self.end_t:
+            # Finish the turn -> go straight for EXIT_STRAIGHT_S
+            self.active = False
+            self.servo.center()
+            self.set_speed(CRUISE_SPEED); self.fwd()
+            self.after_straight_until = now + EXIT_STRAIGHT_S
+    def ready_for_new_turn(self):
+        return (not self.active) and (time.monotonic() >= self.after_straight_until)
+    def straight_since(self):
+        if self.after_straight_until == 0.0:
+            return 0.0
+        now = time.monotonic()
+        if self.active: return 0.0
+        return max(0.0, now - (self.end_t if self.end_t else now))
+
+# ===============================
+# ============ MAIN =============
+# ===============================
+def main():
+    GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+    pwm, set_speed, fwd, back, stop = motor_setup()
+
+    # Button (start/pause)
+    GPIO.setup(BTN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    running = False
+    last_btn = GPIO.input(BTN)
+
+    # Sensors
+    setup_ultra(FR_TRIG, FR_ECHO)
+    setup_ultra(LF_TRIG, LF_ECHO)
+    setup_ultra(RT_TRIG, RT_ECHO)
+    fr_f, lf_f, rt_f = MedianFilter(MEDIAN_N), MedianFilter(MEDIAN_N), MedianFilter(MEDIAN_N)
+
+    # Servo
+    pi = pigpio.pi()
+    if not pi.connected: raise RuntimeError("Start pigpio: sudo systemctl start pigpiod")
+    servo = SmoothServo(pi, SERVO)
+
+    # Turn controller
+    turn = TurnEpisode(servo, set_speed, fwd)
+
+    # Timers
+    sample_dt = 1.0 / SAMPLE_HZ
+    last_sample = 0.0
+    telem_dt = 1.0 / TELEMETRY_HZ
+    last_telem = 0.0
+
+    # CSV
+    if LOG_TO_CSV:
+        csv_f = open(CSV_PATH, "w", newline="")
+        csv_w = csv.writer(csv_f)
+        csv_w.writerow(["t","front","left","right","angle","target","speed","running","turn_active","turn_dir","turn_end"])
+
+    # State
+    d_front = d_left = d_right = None
+    preferred_dir = None     # 'L' or 'R' after we lock
+    last_turn_dir = None
+    straight_mark = None
+
+    # Turn counting
+    turns = 0
+
+    # Safe idle
+    set_speed(0); stop(); servo.center()
+    current_speed = 0
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            # Button toggle
+            btn = GPIO.input(BTN)
+            if btn == 0 and last_btn == 1:
+                running = not running
+                if not running:
+                    set_speed(0); stop(); servo.center()
+                    current_speed = 0
+                else:
+                    set_speed(CRUISE_SPEED); fwd()
+                    current_speed = CRUISE_SPEED
+                time.sleep(0.25)
+            last_btn = btn
+
+            if running and (now - last_sample >= sample_dt):
+                last_sample = now
+                d_front = fr_f.push(measure_cm(FR_TRIG, FR_ECHO))
+                time.sleep(INTER_PING_DELAY)
+                d_left  = lf_f.push(measure_cm(LF_TRIG, LF_ECHO))
+                time.sleep(INTER_PING_DELAY)
+                d_right = rt_f.push(measure_cm(RT_TRIG, RT_ECHO))
+
+                # ----- Turn decision -----
+                if turn.ready_for_new_turn():
+                    need_turn = (d_front is not None and d_front <= FRONT_START_CM)
+                    if need_turn:
+                        # Pick side
+                        if preferred_dir in ('L','R'):
+                            side = preferred_dir
+                        else:
+                            L = d_left  if d_left  is not None else -1.0
+                            R = d_right if d_right is not None else -1.0
+                            side = 'R' if R >= L else 'L'
+
+                        # Start fixed timed turn
+                        turn.start(side)
+                        last_turn_dir = side
+                        straight_mark = None
+
+                        # Increment turn counter
+                        turns += 1
+                        if DEBUG: print(f"🔄 Turn {turns} ({side})")
+                        if turns >= 13:
+                            set_speed(0); stop(); servo.center()
+                            if DEBUG: print("🎉 12 turns complete. Stopping.")
+                            break
+
+                else:
+                    # Straight time for preferred lock
+                    if (d_front is not None and d_front >= CLEAR_CM) and (not turn.active):
+                        if straight_mark is None:
+                            straight_mark = now
+                        straight_for = now - straight_mark
+                        if preferred_dir is None and last_turn_dir in ('L','R'):
+                            if straight_for >= LOCK_CONFIRM_STRAIGHT_S:
+                                preferred_dir = last_turn_dir
+                    else:
+                        straight_mark = None
+
+            # Update turn controller and servo
+            turn.update()
+            servo.tick(time.time())
+
+            # Keep moving (unless paused): straight default
+            if running and not turn.active:
+                set_speed(CRUISE_SPEED); fwd()
+
+            # Timing / Telemetry
+            time.sleep(LOOP_SLEEP)
+            if DEBUG and (time.monotonic() - last_telem >= telem_dt):
+                last_telem = time.monotonic()
+                fr = f"{d_front:.1f}" if d_front is not None else "—"
+                lf = f"{d_left:.1f}"  if d_left  is not None else "—"
+                rt = f"{d_right:.1f}" if d_right is not None else "—"
+                print(f"[{time.strftime('%H:%M:%S')}] "
+                      f"F={fr:>5} L={lf:>5} R={rt:>5} | "
+                      f"Ang={servo.angle:5.1f}->{servo.target:5.1f} | "
+                      f"Run={int(running)} Turn={'Y' if turn.active else 'N'}({turn.dir or '-'}) | "
+                      f"Pref={preferred_dir or '-'} | Turns={turns}")
+
+                if LOG_TO_CSV:
+                    csv_w.writerow([
+                        f"{time.time():.3f}",
+                        f"{d_front:.2f}" if d_front is not None else "",
+                        f"{d_left:.2f}"  if d_left  is not None else "",
+                        f"{d_right:.2f}" if d_right is not None else "",
+                        f"{servo.angle:.1f}",
+                        f"{servo.target:.1f}",
+                        str(CRUISE_SPEED if running else 0),
+                        str(int(running)),
+                        str(int(turn.active)),
+                        (turn.dir or "-"),
+                        f"{getattr(turn, 'end_t', 0.0):.3f}",
+                    ])
+
+    finally:
+        try:
+            set_speed(0); stop(); pwm.stop()
+        finally:
+            GPIO.cleanup()
+            try:
+                pi.set_servo_pulsewidth(SERVO, 0); pi.stop()
+            except:
+                pass
+            if LOG_TO_CSV:
+                try: csv_f.close()
+                except: pass
+            print("Clean exit.")
+
+if __name__ == "__main__":
+    main()
