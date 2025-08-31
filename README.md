@@ -19,9 +19,9 @@ This repository contains all the core code used in the competition.
 
 ### 🧩 Hardware:
 - Microcontroller (e.g., Raspberry Pi 4 Model B)
-- 2x Ultrasonic Sensors (for distance measurement and obstacle avoidance)
+- 3x Ultrasonic Sensors (for distance measurement and obstacle avoidance)
 - IMX500 AI Camera (for color-based zone detection)
-- Motor Driver & Chassis
+- Motor Driver L298N 
 - Power Supply (Battery Pack)
 
 ### 💻 Software:
