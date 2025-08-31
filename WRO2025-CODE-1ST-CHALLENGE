@@ -11,7 +11,7 @@ SERVO = 4                             # Steering servo (signal)
 FR_TRIG, FR_ECHO = 10, 9              # Front ultrasonic
 LF_TRIG, LF_ECHO = 5, 6               # Left ultrasonic
 RT_TRIG, RT_ECHO = 24, 23             # Right ultrasonic
-BTN = 2                               # Start/Pause button (to GND)
+BTN = 16                               # Start/Pause button (to GND)
 
 # ===============================
 # ======= MAIN TUNING KNOBS =====
