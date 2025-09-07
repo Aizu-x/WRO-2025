@@ -108,6 +108,7 @@ Our strategy for this year’s challenge focuses on reliability and simplicity:
 
 Team Leader: Abbas Modhaffar
 Team Members: Sara Salman | Qutiba Almanshad
+
 We are a dedicated group of students competing in WRO 2025 Future Engineers, focused on building practical autonomous systems within limited time and resources. Abbas Which is me, focused on the task of coding and understanding the logic behind our task and how we should design the robot. Sara and Qutiba both worked on the robot structure and design, as well as finding solutions and out of the box methods to make the robot complete these given tasks.
 
 ---
