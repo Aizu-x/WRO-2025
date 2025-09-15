@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+import time, csv, collections, os, json, subprocess
+import RPi.GPIO as GPIO
+import pigpio
+
+# ===============================
+# ========= PINS (BCM) ==========
+# ===============================
+ENAB, IN3, IN4 = 17, 22, 27          # L298N (single motor side)
+SERVO = 4                             # Steering servo (signal)
+FR_TRIG, FR_ECHO = 10, 9              # Front ultrasonic
+LF_TRIG, LF_ECHO = 5, 6               # Left ultrasonic
+RT_TRIG, RT_ECHO = 24, 23             # Right ultrasonic
+BTN = 16                               # Start/Pause button (to GND)
+
+# ===============================
+# ======= MAIN TUNING KNOBS =====
+# ===============================
+
+# ---- Speeds (% PWM) ----
+CRUISE_SPEED      = 55     # normal forward
+TURN_SPEED        = 55     # while turning
+PAUSE_AFTER_TURN_S = 0.5   # pause after ultrasonic turn
+
+# ---- Steering (absolute angles) ----
+STEER_CENTER      = 131    # your calibrated straight
+TURN_DEG          = 45
+STEER_RANGE       = 50
+STEER_MIN         = max(0,   STEER_CENTER - STEER_RANGE)
+STEER_MAX         = min(180, STEER_CENTER + STEER_RANGE)
+
+# ---- Turn timing ----
+TURN_TIME_S       = 2.0
+EXIT_STRAIGHT_S   = 1
+
+# ---- Obstacle detection ----
+FRONT_START_CM    = 90
+CLEAR_CM          = 130
+
+# ---- Self-learning direction lock ----
+LOCK_CONFIRM_STRAIGHT_S = 0.75
+
+# ---- Ultrasonic sampling ----
+SAMPLE_HZ         = 15
+ECHO_TIMEOUT      = 0.02
+MEDIAN_N          = 3
+INTER_PING_DELAY  = 0.003
+LOOP_SLEEP        = 0.003
+
+# ---- Servo output (pigpio) ----
+SERVO_MIN_US, SERVO_MAX_US = 1000, 2000
+SMOOTH_STEP_DEG   = 6
+SMOOTH_HZ         = 180
+
+# ---- Debug / CSV ----
+DEBUG             = True
+LOG_TO_CSV        = False
+CSV_PATH          = "wro_log.csv"
+TELEMETRY_HZ      = 5
+
+# ---- Camera detection steering ----
+CAMERA_JSON_PATH  = "/home/roshdi-24/picamera2/results/detections.json"
+CAMERA_CHECK_HZ   = 3
+CAMERA_LEFT_TAG   = "greenbox"
+CAMERA_RIGHT_TAG  = "redbox"
+CAMERA_COOLDOWN_S = 2.0  # Adjustable delay after detection before next detection
+
+# ===============================
+# ========== UTILITIES ==========
+# ===============================
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def angle_to_us(a):
+    a = clamp(a, 0, 180)
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
+
+class MedianFilter:
+    def __init__(self, n): self.buf = collections.deque(maxlen=n)
+    def push(self, x):
+        if x is not None: self.buf.append(x)
+        if not self.buf: return None
+        s = sorted(self.buf)
+        return s[len(s)//2]
+
+# ===============================
+# ======== HARDWARE I/O =========
+# ===============================
+def setup_ultra(trig, echo):
+    GPIO.setup(trig, GPIO.OUT); GPIO.output(trig, 0)
+    GPIO.setup(echo, GPIO.IN)
+
+def measure_cm(trig, echo):
+    GPIO.output(trig, 0); time.sleep(0.000002)
+    GPIO.output(trig, 1); time.sleep(0.00001); GPIO.output(trig, 0)
+    t0 = time.perf_counter()
+    while GPIO.input(echo) == 0:
+        if time.perf_counter() - t0 > ECHO_TIMEOUT: return None
+    start = time.perf_counter()
+    while GPIO.input(echo) == 1:
+        if time.perf_counter() - start > ECHO_TIMEOUT: return None
+    end = time.perf_counter()
+    return (end - start) * 34300.0 / 2.0
+
+def motor_setup():
+    GPIO.setup(ENAB, GPIO.OUT); GPIO.setup(IN3, GPIO.OUT); GPIO.setup(IN4, GPIO.OUT)
+    pwm = GPIO.PWM(ENAB, 1000); pwm.start(0)
+    def set_speed(p): pwm.ChangeDutyCycle(clamp(p, 0, 100))
+    def fwd():  GPIO.output(IN3,1); GPIO.output(IN4,0)
+    def back(): GPIO.output(IN3,0); GPIO.output(IN4,1)
+    def stop(): GPIO.output(IN3,0); GPIO.output(IN4,0)
+    return pwm, set_speed, fwd, back, stop
+
+class SmoothServo:
+    def __init__(self, pi, pin):
+        self.pi, self.pin = pi, pin
+        self.angle = STEER_CENTER
+        self.target = STEER_CENTER
+        self.dt = 1.0 / SMOOTH_HZ
+        self.last = 0.0
+        self.pi.set_servo_pulsewidth(pin, angle_to_us(self.angle))
+    def set_target(self, ang):
+        self.target = clamp(ang, STEER_MIN, STEER_MAX)
+    def center(self):
+        self.set_target(STEER_CENTER)
+    def tick(self, now):
+        if now - self.last < self.dt: return
+        self.last = now
+        if self.target == self.angle: return
+        step = SMOOTH_STEP_DEG if self.target > self.angle else -SMOOTH_STEP_DEG
+        nxt = self.angle + step
+        if (step > 0 and nxt > self.target) or (step < 0 and nxt < self.target):
+            nxt = self.target
+        self.angle = clamp(nxt, STEER_MIN, STEER_MAX)
+        self.pi.set_servo_pulsewidth(self.pin, angle_to_us(self.angle))
+
+# ===============================
+# ======= TURN CONTROLLER =======
+# ===============================
+class TurnEpisode:
+    def __init__(self, servo, set_speed, fwd):
+        self.servo = servo
+        self.set_speed = set_speed
+        self.fwd = fwd
+        self.active = False
+        self.end_t = 0.0
+        self.after_straight_until = 0.0
+        self.pause_until = 0.0   # <-- new
+        self.dir = None
+    def start(self, side_dir):
+        self.dir = side_dir
+        ang = STEER_CENTER + ( +TURN_DEG if side_dir == 'L' else -TURN_DEG )
+        self.servo.set_target(ang)
+        self.set_speed(TURN_SPEED); self.fwd()
+        self.active = True
+        self.end_t = time.monotonic() + TURN_TIME_S
+    def update(self):
+        now = time.monotonic()
+        if self.active and now >= self.end_t:
+            self.active = False
+            self.servo.center()
+            self.pause_until = now + PAUSE_AFTER_TURN_S   # <-- new: start pause
+            self.after_straight_until = now + EXIT_STRAIGHT_S
+    def ready_for_new_turn(self):
+        return (not self.active) and (time.monotonic() >= self.after_straight_until)
+    def in_pause(self):
+        return time.monotonic() < self.pause_until
+    def straight_since(self):
+        if self.after_straight_until == 0.0: return 0.0
+        now = time.monotonic()
+        if self.active: return 0.0
+        return max(0.0, now - (self.end_t if self.end_t else now))
+
+# ===============================
+# ==== CAMERA WIGGLE SEQUENCE ====
+# ===============================
+def check_camera_detection():
+    try:
+        if not os.path.exists(CAMERA_JSON_PATH): return None
+        with open(CAMERA_JSON_PATH, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, list): return None
+        labels = [d.get("label","").lower() for d in data]
+        if any(CAMERA_LEFT_TAG in lbl for lbl in labels): return 'L'
+        if any(CAMERA_RIGHT_TAG in lbl for lbl in labels): return 'R'
+    except Exception as e:
+        if DEBUG: print(f"[Camera] Error: {e}")
+    return None
+
+class CameraWiggle:
+    def __init__(self, servo, set_speed, fwd, wiggle_s=0.75):
+        self.servo = servo
+        self.set_speed = set_speed
+        self.fwd = fwd
+        self.wiggle_s = wiggle_s
+        self.active = False
+        self.sequence = []
+        self.index = 0
+        self.next_time = 0.0
+        self.lock_ultra = False
+
+    def start(self, color):
+        if self.active:
+            return
+        self.lock_ultra = True
+        if color == 'R':
+            self.sequence = [
+                (STEER_CENTER - TURN_DEG, self.wiggle_s),  # right
+                (STEER_CENTER + TURN_DEG, self.wiggle_s),  # left
+                (STEER_CENTER, self.wiggle_s),             # straight
+            ]
+        else:  # green / left
+            self.sequence = [
+                (STEER_CENTER + TURN_DEG, self.wiggle_s),  # left
+                (STEER_CENTER - TURN_DEG, self.wiggle_s),  # right
+                (STEER_CENTER, self.wiggle_s),             # straight
+            ]
+        self.index = 0
+        self.active = True
+        self.next_time = time.monotonic()
+        if DEBUG:
+            col_name = "Red" if color == 'R' else "Green"
+            print(f"[Camera] {col_name} detected → starting wiggle sequence")
+
+    def update(self):
+        if not self.active:
+            return
+        now = time.monotonic()
+        if now >= self.next_time:
+            ang, duration = self.sequence[self.index]
+            self.servo.set_target(ang)
+            self.set_speed(TURN_SPEED)
+            self.fwd()
+            self.next_time = now + duration
+            self.index += 1
+            if self.index >= len(self.sequence):
+                self.active = False
+                self.lock_ultra = False
+                if DEBUG:
+                    print("[Camera] Wiggle sequence complete → straight")
+
+    def busy(self):
+        return self.active
+
+# ===============================
+# ============ MAIN =============
+# ===============================
+def main():
+    GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+    pwm, set_speed, fwd, back, stop = motor_setup()
+
+    # Start object detection subprocess
+    try:
+        detection_proc = subprocess.Popen(
+            ["python3", "/home/roshdi-24/picamera2/examples/imx500/imx500_object_detection_demo.py"]
+        )
+        if DEBUG: print("[Camera] Object detection demo started.")
+    except Exception as e:
+        if DEBUG: print(f"[Camera] Failed to start detection demo: {e}")
+        detection_proc = None
+
+    # Button (start/pause)
+    GPIO.setup(BTN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    running = False
+    last_btn = GPIO.input(BTN)
+
+    # Sensors
+    setup_ultra(FR_TRIG, FR_ECHO)
+    setup_ultra(LF_TRIG, LF_ECHO)
+    setup_ultra(RT_TRIG, RT_ECHO)
+    fr_f, lf_f, rt_f = MedianFilter(MEDIAN_N), MedianFilter(MEDIAN_N), MedianFilter(MEDIAN_N)
+
+    # Servo
+    pi = pigpio.pi()
+    if not pi.connected: raise RuntimeError("Start pigpio: sudo systemctl start pigpiod")
+    servo = SmoothServo(pi, SERVO)
+
+    # Controllers
+    turn = TurnEpisode(servo, set_speed, fwd)
+    camwig = CameraWiggle(servo, set_speed, fwd, wiggle_s=0.5)
+    cam_last = 0.0
+    cam_last_detection = 0.0  # cooldown timer for camera
+    cam_dt = 1.0 / CAMERA_CHECK_HZ
+
+    # Timers
+    sample_dt = 1.0 / SAMPLE_HZ
+    last_sample = 0.0
+    telem_dt = 1.0 / TELEMETRY_HZ
+    last_telem = 0.0
+
+    # CSV
+    if LOG_TO_CSV:
+        csv_f = open(CSV_PATH, "w", newline="")
+        csv_w = csv.writer(csv_f)
+        csv_w.writerow(["t","front","left","right","angle","target","speed","running","turn_active","turn_dir","turn_end"])
+
+    # State
+    d_front = d_left = d_right = None
+    preferred_dir = None
+    last_turn_dir = None
+    straight_mark = None
+    turns = 0
+
+    # Safe idle
+    set_speed(0); stop(); servo.center()
+    current_speed = 0
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            # Button toggle
+            btn = GPIO.input(BTN)
+            if btn == 0 and last_btn == 1:
+                running = not running
+                if not running:
+                    set_speed(0); stop(); servo.center()
+                    current_speed = 0
+                else:
+                    set_speed(CRUISE_SPEED); fwd()
+                    current_speed = CRUISE_SPEED
+                time.sleep(0.25)
+            last_btn = btn
+
+            if running and (now - last_sample >= sample_dt):
+                last_sample = now
+                d_front = fr_f.push(measure_cm(FR_TRIG, FR_ECHO))
+                time.sleep(INTER_PING_DELAY)
+                d_left  = lf_f.push(measure_cm(LF_TRIG, LF_ECHO))
+                time.sleep(INTER_PING_DELAY)
+                d_right = rt_f.push(measure_cm(RT_TRIG, RT_ECHO))
+
+                # ----- Camera override (wiggle with cooldown) -----
+                if not turn.active and not camwig.busy():
+                    if now - cam_last >= cam_dt and (now - cam_last_detection >= CAMERA_COOLDOWN_S):
+                        cam_last = now
+                        cam_dir = check_camera_detection()
+                        if cam_dir:
+                            camwig.start(cam_dir)
+                            cam_last_detection = now
+
+                # ----- Turn decision (only if camera not active) -----
+                if turn.ready_for_new_turn() and not camwig.active:
+                    need_turn = (d_front is not None and d_front <= FRONT_START_CM)
+                    if need_turn:
+                        if preferred_dir in ('L','R'):
+                            side = preferred_dir
+                        else:
+                            L = d_left  if d_left  is not None else -1.0
+                            R = d_right if d_right is not None else -1.0
+                            side = 'R' if R >= L else 'L'
+                        turn.start(side)
+                        last_turn_dir = side
+                        straight_mark = None
+                        turns += 1
+                        if DEBUG: print(f"🔄 Turn {turns} ({side})")
+                        if turns >= 13:
+                            set_speed(0); stop(); servo.center()
+                            if DEBUG: print("🎉 12 turns complete. Stopping.")
+                            break
+                else:
+                    if (d_front is not None and d_front >= CLEAR_CM) and (not turn.active):
+                        if straight_mark is None:
+                            straight_mark = now
+                        straight_for = now - straight_mark
+                        if preferred_dir is None and last_turn_dir in ('L','R'):
+                            if straight_for >= LOCK_CONFIRM_STRAIGHT_S:
+                                preferred_dir = last_turn_dir
+                    else:
+                        straight_mark = None
+
+            # Update controllers
+            turn.update()
+            camwig.update()
+            servo.tick(time.time())
+
+            # Keep moving straight if nothing else, pause if ultrasonic turn just ended
+            if running:
+                if turn.in_pause():
+                    set_speed(0); stop()
+                elif not turn.active and not camwig.busy():
+                    set_speed(CRUISE_SPEED); fwd()
+
+            # Telemetry
+            time.sleep(LOOP_SLEEP)
+            if DEBUG and (time.monotonic() - last_telem >= telem_dt):
+                last_telem = time.monotonic()
+                fr = f"{d_front:.1f}" if d_front is not None else "—"
+                lf = f"{d_left:.1f}"  if d_left  is not None else "—"
+                rt = f"{d_right:.1f}" if d_right is not None else "—"
+                print(f"[{time.strftime('%H:%M:%S')}] F={fr:>5} L={lf:>5} R={rt:>5} | "
+                      f"Ang={servo.angle:5.1f}->{servo.target:5.1f} | Run={int(running)} "
+                      f"Turn={'Y' if turn.active else 'N'}({turn.dir or '-'}) | "
+                      f"Pref={preferred_dir or '-'} | Turns={turns}")
+
+                if LOG_TO_CSV:
+                    csv_w.writerow([
+                        f"{time.time():.3f}",
+                        f"{d_front:.2f}" if d_front is not None else "",
+                        f"{d_left:.2f}"  if d_left  is not None else "",
+                        f"{d_right:.2f}" if d_right is not None else "",
+                        f"{servo.angle:.1f}",
+                        f"{servo.target:.1f}",
+                        str(CRUISE_SPEED if running else 0),
+                        str(int(running)),
+                        str(int(turn.active)),
+                        (turn.dir or "-"),
+                        f"{getattr(turn, 'end_t', 0.0):.3f}",
+                    ])
+
+    finally:
+        # Stop motors
+        try:
+            set_speed(0); stop(); pwm.stop()
+        finally:
+            # Terminate camera process
+            try:
+                if detection_proc:
+                    detection_proc.terminate()
+                    if DEBUG: print("[Camera] Object detection demo terminated.")
+            except: pass
+            GPIO.cleanup()
+            try:
+                pi.set_servo_pulsewidth(SERVO, 0); pi.stop()
+            except: pass
+            if LOG_TO_CSV:
+                try: csv_f.close()
+                except: pass
+            print("Clean exit.")
+
+if __name__ == "__main__":
+    main()
