@@ -106,6 +106,8 @@ We are a dedicated group of students competing in WRO 2025 Future Engineers, foc
 ## Demo Video
 
 You can find a demonstration of the robot in action here: [[YouTube Video Link](https://youtu.be/r5Aq6oNJvic?si=vGrpnwZhYPXGCZbK)]
+And [https://youtube.com/shorts/TgukKyslCZE?si=nlJlC7Cx-iMlU_Ep]
+
 
 ---
 
