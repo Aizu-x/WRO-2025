@@ -87,16 +87,6 @@ A single push button toggles the robot between paused and active states, allowin
 
 ---
 
-## Repository Structure
-
-- `Code` – Main program and testing scripts
-- `Schemes` – CAD files, diagrams, journals, and BOM
-- `ImagesV` – Photos of prototypes and robot parts
-- `ImagesT` – Team photos, logo, and documentation of progress
-- `Videos` – YouTube links showing robot trials
-
----
-
 ## Strategy
 
 Our strategy for this year’s challenge focuses on reliability and simplicity:
