@@ -1,0 +1,158 @@
+import time
+import RPi.GPIO as GPIO
+import pigpio
+
+# ===============================
+# ========= CONFIG ==============
+# ===============================
+
+# --- Escape logic ---
+REV_TIME          = 0.5        # Reverse duration (seconds)
+FWD_SMALL_TIME    = 0.5        # First small forward step (seconds)
+FWD_EXIT_TIME     = 2.0        # Final forward step (seconds)
+
+REV_SPEED         = 40         # % PWM for reverse
+FWD_SPEED         = 40         # % PWM for first small forward
+FWD_EXIT_SPEED    = 70         # % PWM for final exit forward
+
+# --- Steering calibration ---
+STEER_CENTER      = 131        # Calibrated straight angle
+STEER_TURN        = 70         # Offset for left/right turn
+
+# --- Servo limits ---
+SERVO_MIN_US, SERVO_MAX_US = 1000, 2000
+
+# --- Pins (BCM) ---
+ENAB, IN3, IN4 = 17, 22, 27    # L298N motor
+SERVO = 4                      # Steering servo
+LF_TRIG, LF_ECHO = 5, 6        # Left ultrasonic
+RT_TRIG, RT_ECHO = 24, 23      # Right ultrasonic
+BTN = 16                       # Button (to GND)
+
+# ===============================
+# ========= UTILITIES ===========
+# ===============================
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def angle_to_us(a):
+    a = clamp(a, 0, 180)
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a/180.0))
+
+def setup_ultra(trig, echo):
+    GPIO.setup(trig, GPIO.OUT); GPIO.output(trig, 0)
+    GPIO.setup(echo, GPIO.IN)
+
+def measure_cm(trig, echo, timeout=0.02):
+    GPIO.output(trig, 0); time.sleep(0.000002)
+    GPIO.output(trig, 1); time.sleep(0.00001); GPIO.output(trig, 0)
+    t0 = time.perf_counter()
+    while GPIO.input(echo) == 0:
+        if time.perf_counter() - t0 > timeout: return None
+    start = time.perf_counter()
+    while GPIO.input(echo) == 1:
+        if time.perf_counter() - start > timeout: return None
+    end = time.perf_counter()
+    return (end - start) * 34300.0 / 2.0
+
+def motor_setup():
+    GPIO.setup(ENAB, GPIO.OUT); GPIO.setup(IN3, GPIO.OUT); GPIO.setup(IN4, GPIO.OUT)
+    pwm = GPIO.PWM(ENAB, 1000); pwm.start(0)
+    def set_speed(p): pwm.ChangeDutyCycle(clamp(p, 0, 100))
+    def fwd():  GPIO.output(IN3,1); GPIO.output(IN4,0)
+    def back(): GPIO.output(IN3,0); GPIO.output(IN4,1)
+    def stop(): GPIO.output(IN3,0); GPIO.output(IN4,0)
+    return pwm, set_speed, fwd, back, stop
+
+class Servo:
+    def __init__(self, pi, pin):
+        self.pi, self.pin = pi, pin
+        self.center()
+    def set_angle(self, ang):
+        self.pi.set_servo_pulsewidth(self.pin, angle_to_us(ang))
+    def center(self): self.set_angle(STEER_CENTER)
+    def turn_right(self): self.set_angle(STEER_CENTER - STEER_TURN)
+    def turn_left(self): self.set_angle(STEER_CENTER + STEER_TURN)
+
+# ===============================
+# ============ MAIN =============
+# ===============================
+def main():
+    GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+
+    pwm, set_speed, fwd, back, stop = motor_setup()
+    GPIO.setup(BTN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    setup_ultra(LF_TRIG, LF_ECHO)
+    setup_ultra(RT_TRIG, RT_ECHO)
+
+    pi = pigpio.pi()
+    if not pi.connected: raise RuntimeError("Start pigpio first: sudo systemctl start pigpiod")
+    servo = Servo(pi, SERVO)
+
+    print("Ready. Press button to escape...")
+
+    try:
+        while True:
+            if GPIO.input(BTN) == 0:
+                print("Button pressed! Choosing exit side...")
+                time.sleep(0.3)  # debounce
+
+                # Measure left/right only
+                d_left  = measure_cm(LF_TRIG, LF_ECHO)
+                d_right = measure_cm(RT_TRIG, RT_ECHO)
+
+                print(f"Left={d_left}cm, Right={d_right}cm")
+
+                # Pick side
+                L = d_left if d_left is not None else 0
+                R = d_right if d_right is not None else 0
+                exit_side = 'R' if R >= L else 'L'
+                print(f"Exit side chosen: {exit_side}")
+
+                # Step 1: Reverse straight
+                servo.center()
+                set_speed(REV_SPEED); back()
+                time.sleep(REV_TIME); stop()
+
+                # Step 2: Forward small towards exit side
+                if exit_side == 'R': servo.turn_right()
+                else: servo.turn_left()
+                set_speed(FWD_SPEED); fwd()
+                time.sleep(FWD_SMALL_TIME); stop()
+
+                # Step 3: Reverse opposite of exit side
+                if exit_side == 'R': servo.turn_left()
+                else: servo.turn_right()
+                set_speed(REV_SPEED); back()
+                time.sleep(REV_TIME); stop()
+                
+                # Step 4: Forward small towards exit side
+                if exit_side == 'R': servo.turn_right()
+                else: servo.turn_left()
+                set_speed(FWD_SPEED); fwd()
+                time.sleep(FWD_SMALL_TIME); stop()
+
+                # Step 5: Reverse opposite of exit side
+                if exit_side == 'R': servo.turn_left()
+                else: servo.turn_right()
+                set_speed(REV_SPEED); back()
+                time.sleep(REV_TIME); stop()
+
+                # Step 6: Forward longer towards exit side
+                if exit_side == 'R': servo.turn_right()
+                else: servo.turn_left()
+                set_speed(FWD_EXIT_SPEED); fwd()
+                time.sleep(FWD_EXIT_TIME); stop()
+
+                servo.center()
+                print("Escape maneuver complete.")
+
+            time.sleep(0.05)
+
+    finally:
+        set_speed(0); stop(); pwm.stop()
+        GPIO.cleanup()
+        pi.set_servo_pulsewidth(SERVO, 0); pi.stop()
+        print("Clean exit.")
+
+if __name__ == "__main__":
+    main()
