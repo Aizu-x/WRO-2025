@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import time, csv, collections
 import RPi.GPIO as GPIO
 import pigpio
@@ -11,7 +10,7 @@ SERVO = 4                             # Steering servo (signal)
 FR_TRIG, FR_ECHO = 10, 9              # Front ultrasonic
 LF_TRIG, LF_ECHO = 5, 6               # Left ultrasonic
 RT_TRIG, RT_ECHO = 24, 23             # Right ultrasonic
-BTN = 16                               # Start/Pause button (to GND)
+BTN = 16                            # Start/Pause button (to GND)
 
 # ===============================
 # ======= MAIN TUNING KNOBS =====
@@ -34,7 +33,7 @@ TURN_TIME_S       = 1.0   # how long to hold the turn, no matter the distance
 EXIT_STRAIGHT_S   = 1     # how long to drive straight after a turn before next decision
 
 # ---- Obstacle detection ----
-FRONT_START_CM    = 90    # start a turn decision if front <= this
+FRONT_START_CM    = 60    # start a turn decision if front <= this
 CLEAR_CM          = 130   # consider path “clear/straight” when front >= this
 
 # ---- Self-learning direction lock ----
@@ -131,7 +130,6 @@ class SmoothServo:
 # ===============================
 class TurnEpisode:
     """
-    Handles the fixed-angle, fixed-time steering you asked for:
     - When active: sets servo to CENTER ± TURN_DEG and holds TURN_SPEED.
     - After TURN_TIME_S: returns to straight and enforces a brief EXIT_STRAIGHT_S
       before considering new turns.
@@ -265,7 +263,7 @@ def main():
                         turns += 1
                         if DEBUG: print(f"🔄 Turn {turns} ({side})")
                         if turns >= 13:
-                            set_speed(0); stop(); servo.center()
+                            stop(); set_speed(0); servo.center()
                             if DEBUG: print("🎉 12 turns complete. Stopping.")
                             break
 
