@@ -1,0 +1,111 @@
+import os
+import json
+import cv2
+import numpy as np
+
+# ===============================
+# GLOBAL DETECTIONS
+# ===============================
+last_detections = []
+
+# ===============================
+# COLOR DETECTION USING OPENCV
+# ===============================
+def detect_colored_boxes(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    detections = []
+
+    # ---- Dark Green Detection ----
+   # dark_green_lower = np.array([40, 120, 40])   # H, S, V
+    #dark_green_upper = np.array([75, 255, 100])  # H, S, V
+    dark_green_lower = np.array([0, 100, 00])   # H, S, V
+    dark_green_upper = np.array([70, 255, 255])  # H, S, V
+    green_mask = cv2.inRange(hsv, dark_green_lower, dark_green_upper)
+
+    # ---- Blue Detection (labeled as redbox) ----
+    blue_lower = np.array([100, 150, 50])
+    blue_upper = np.array([140, 255, 255])
+    blue_mask = cv2.inRange(hsv, blue_lower, blue_upper)
+
+    # ---- Morphology ----
+    kernel = np.ones((5,5), np.uint8)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
+
+    # ---- Green Contours ----
+    contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w*h > 1000:  # Minimum area filter
+            detections.append({"label": "greenbox", "x": int(x), "y": int(y), "w": int(w), "h": int(h)})
+
+    # ---- Blue Contours labeled as Red ----
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w*h > 1000:
+            detections.append({"label": "redbox", "x": int(x), "y": int(y), "w": int(w), "h": int(h)})
+
+    return detections
+
+# ===============================
+# SAVE DETECTIONS TO JSON
+# ===============================
+def save_detections_json(detections):
+    os.makedirs("/home/roshdi-24/picamera2/results", exist_ok=True)
+    with open("/home/roshdi-24/picamera2/results/detections.json", "w") as f:
+        json.dump(detections, f, indent=2)
+
+# ===============================
+# DRAW DETECTIONS ON FRAME
+# ===============================
+def draw_detections(frame, detections):
+    for det in detections:
+        x, y, w, h = det["x"], det["y"], det["w"], det["h"]
+        if det["label"] == "redbox":
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (255,0,0), 2)  # blue color to match camera swap
+            cv2.putText(frame, "Redbox", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+        elif det["label"] == "greenbox":
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+            cv2.putText(frame, "Greenbox", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    return frame
+
+# ===============================
+# MAIN
+# ===============================
+def main():
+    from picamera2 import Picamera2
+
+    picam2 = Picamera2()
+    picam2.preview_configuration.main.size = (640, 480)
+    picam2.preview_configuration.main.format = "BGR888"
+    picam2.preview_configuration.controls.FrameRate = 30
+    picam2.configure("preview")
+    picam2.start()
+
+    print("Running... Press Q to quit.")
+
+    global last_detections
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            last_detections = detect_colored_boxes(frame)
+            save_detections_json(last_detections)
+
+            frame_with_boxes = draw_detections(frame, last_detections)
+            cv2.imshow("Detection Preview", frame_with_boxes)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    finally:
+        cv2.destroyAllWindows()
+        print("Clean exit.")
+
+if __name__ == "__main__":
+    main()
