@@ -33,8 +33,8 @@ Our robot operates autonomously using a combination of computer vision and ultra
   
 - IMX500 AI Camera – Captures real-time video for detecting red and green zones
   
-  <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/68347c52-910b-4d98-8b58-7c9e420d184c" />
-  
+  <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/3d020543-a715-4298-a8a6-601edc5b8fc9" />
+
 - L298N Motor Driver – Controls DC motor speed and direction
   
   <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/e416f76b-b5c2-434b-9d48-0efdffc2f62e" />
@@ -46,6 +46,11 @@ Our robot operates autonomously using a combination of computer vision and ultra
 - Ultrasonic Sensors (x3) – Mounted at front, left, and right for collision avoidance
   
   <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/4ad22a96-c1a5-42f4-83c0-3bc161f9fe8b" />
+
+- Arduino Kit Button - Used to start the code
+- 
+  <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/98810377-4da1-4586-bd1d-3cb2a21a6ae6" />
+  
   
 - Battery Pack (x2) - (Total of 4 batteries used)
   
@@ -90,7 +95,7 @@ A single push button toggles the robot between paused and active states, allowin
 ## Strategy
 
 Our strategy for this year’s challenge focuses on reliability and simplicity:
-  We are using ultrasonic sensors as our eyes for direction and a simple machine learning aspect within our code so that it locks the first steering decision as the correct decision for the corner turns, and our timed steering which performs         exceptionally for our case instead of having a case-oriented steering system. Jokes aside, our goal is to simply not crash.
+  We are using ultrasonic sensors as our eyes for direction and a simple machine learning aspect within our code so that it locks the first steering decision as the correct   decision for the corner turns, and our timed steering which performs exceptionally for our case instead of having a case-oriented steering system. Jokes aside, our goal     is to simply not crash.
 
 ---
 
