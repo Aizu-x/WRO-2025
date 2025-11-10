@@ -4,7 +4,7 @@ Welcome to the official repository for Team KCST's Autonomous Robot project, dev
 
 This robot is capable of autonomous driving, real-time color detection, obstacle avoidance, and intelligent navigation. It demonstrates practical engineering and problem-solving applied directly to competition requirements.
 
----
+----
 
 ## Project Overview
 
